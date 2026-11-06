@@ -160,7 +160,7 @@ class Job:
     result: Any = field(default=None, repr=False)
     error: BaseException | None = field(default=None, repr=False)
     attempt: int = field(default=0, repr=False)
-    max_retries: int = field(default=0, repr=False)
+    max_retries: int | None = field(default=None, repr=False)
     _decision_trace: list[str] = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
@@ -168,6 +168,8 @@ class Job:
             self.id = uuid.uuid4().hex[:12]
         if isinstance(self.priority, int) and not isinstance(self.priority, Priority):
             self.priority = Priority(self.priority)
+        if self.max_retries is not None and self.max_retries < 0:
+            raise ValueError("max_retries must be >= 0")
         if self.submit_time == 0.0:
             self.submit_time = time.monotonic()
 

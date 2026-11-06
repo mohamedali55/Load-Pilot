@@ -26,6 +26,7 @@ def _context(**overrides) -> AdmissionContext:
     values = {
         "system_pressure": 0.0,
         "resource_available": ResourceVector(cpu=8, memory=256, slots=4),
+        "resource_capacity": ResourceVector(cpu=8, memory=256, slots=4),
         "tenant_queue_size": 0,
         "tenant_running_count": 0,
         "tenant_max_queue": None,
@@ -38,12 +39,22 @@ def _context(**overrides) -> AdmissionContext:
 
 
 class TestAdmissionPolicies:
-    def test_resource_limit_rejects_job(self):
+    def test_resource_limit_rejects_job_that_exceeds_total_capacity(self):
         job = Job(id="large", tenant_id="tenant", estimated_cpu=9)
         assert (
             ResourceBasedPolicy().evaluate(job, _context())
             is AdmissionDecision.REJECT
         )
+
+    def test_temporarily_unavailable_resources_defer_job(self):
+        job = Job(id="waiting", tenant_id="tenant", estimated_cpu=4)
+        decision = ResourceBasedPolicy().evaluate(
+            job,
+            _context(
+                resource_available=ResourceVector(cpu=0, memory=0, slots=0),
+            ),
+        )
+        assert decision is AdmissionDecision.DEFER
 
     def test_queue_and_concurrency_limits(self):
         policy = QueueLimitPolicy()

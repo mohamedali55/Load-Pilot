@@ -45,6 +45,7 @@ class SchedulerEngine:
         "_fairness_debt",
         "_tenant_weights",
         "_job_index",
+        "_known_jobs",
     )
 
     def __init__(self, config: EngineConfig) -> None:
@@ -57,6 +58,7 @@ class SchedulerEngine:
         self._tenant_weights: dict[str, float] = {}
         # Secondary index: job_id → Job for O(1) look-ups and removals.
         self._job_index: dict[str, Job] = {}
+        self._known_jobs: dict[str, Job] = {}
 
     # ------------------------------------------------------------------
     # Job lifecycle
@@ -75,6 +77,7 @@ class SchedulerEngine:
         """
         if job.id in self._job_index:
             raise ValueError(f"Job {job.id!r} is already enqueued")
+        self.track_job(job)
 
         if job.submit_time == 0.0:
             job.submit_time = time.monotonic()
@@ -90,6 +93,86 @@ class SchedulerEngine:
 
         # Ensure the tenant has a fairness-debt entry.
         self._fairness_debt.setdefault(job.tenant_id, 0.0)
+
+    def track_job(self, job: Job) -> None:
+        """Track a submitted job so dependencies can be resolved by ID."""
+        existing = self._known_jobs.get(job.id)
+        if existing is not None and existing is not job:
+            raise ValueError(f"Job ID {job.id!r} has already been submitted")
+        self._known_jobs[job.id] = job
+
+    def resolve_failed_dependencies(self) -> list[Job]:
+        """Fail queued jobs whose dependencies ended without completing."""
+        failed: list[Job] = []
+        for queue in list(self._queues.values()):
+            for job in list(queue):
+                failed_dependency = next(
+                    (
+                        self._known_jobs[dependency_id]
+                        for dependency_id in job.depends_on
+                        if dependency_id in self._known_jobs
+                        and self._known_jobs[dependency_id].status
+                        in {
+                            JobStatus.FAILED,
+                            JobStatus.REJECTED,
+                            JobStatus.CANCELLED,
+                            JobStatus.TIMED_OUT,
+                        }
+                    ),
+                    None,
+                )
+                if failed_dependency is None:
+                    continue
+                job.status = JobStatus.FAILED
+                job.error = RuntimeError(
+                    f"Dependency {failed_dependency.id!r} ended "
+                    f"with status {failed_dependency.status.value}"
+                )
+                job.end_time = time.monotonic()
+                job.trace(str(job.error))
+                self._remove_queued_job(job)
+                failed.append(job)
+        return failed
+
+    def runnable_count(self) -> int:
+        """Return queued jobs whose dependencies have all completed."""
+        return sum(
+            1
+            for queue in self._queues.values()
+            for job in queue
+            if all(
+                dependency_id in self._known_jobs
+                and self._known_jobs[dependency_id].status is JobStatus.COMPLETED
+                for dependency_id in job.depends_on
+            )
+        )
+
+    def fail_unresolved_dependencies(self) -> list[Job]:
+        """Fail queued jobs blocked by missing dependencies or dependency cycles."""
+        failed: list[Job] = []
+        for queue in list(self._queues.values()):
+            for job in list(queue):
+                if all(
+                    dependency_id in self._known_jobs
+                    and self._known_jobs[dependency_id].status is JobStatus.COMPLETED
+                    for dependency_id in job.depends_on
+                ):
+                    continue
+                unresolved = [
+                    dependency_id
+                    for dependency_id in job.depends_on
+                    if dependency_id not in self._known_jobs
+                    or self._known_jobs[dependency_id].status is not JobStatus.COMPLETED
+                ]
+                job.status = JobStatus.FAILED
+                job.error = RuntimeError(
+                    f"Dependencies did not complete: {', '.join(unresolved)}"
+                )
+                job.end_time = time.monotonic()
+                job.trace(str(job.error))
+                self._remove_queued_job(job)
+                failed.append(job)
+        return failed
 
     def remove_job(self, job_id: str) -> Job | None:
         """Remove a job by *job_id* from all internal structures.
@@ -189,7 +272,11 @@ class SchedulerEngine:
         # ----------------------------------------------------------
         # Phase 1: Urgent deadline jobs (slack < 0 → already late)
         # ----------------------------------------------------------
-        urgent_jobs = self._edf.get_urgent(now, threshold=0.0)
+        urgent_jobs = [
+            job
+            for job in self._edf.get_urgent(now, threshold=0.0)
+            if self._dependencies_completed(job)
+        ]
         for job in urgent_jobs:
             if len(selected) >= n:
                 break
@@ -224,7 +311,7 @@ class SchedulerEngine:
         candidates: list[Job] = []
         for queue in self._queues.values():
             for job in queue:
-                if job.id not in selected_ids:
+                if job.id not in selected_ids and self._dependencies_completed(job):
                     candidates.append(job)
 
         if not candidates:
@@ -320,6 +407,10 @@ class SchedulerEngine:
         job.trace(f"scheduled at {job.schedule_time:.6f}")
 
         # Remove from the tenant queue and index.
+        self._remove_queued_job(job)
+
+    def _remove_queued_job(self, job: Job) -> None:
+        """Remove a job from pending queue, EDF index, and pending index."""
         queue = self._queues.get(job.tenant_id)
         if queue is not None:
             try:
@@ -331,6 +422,14 @@ class SchedulerEngine:
 
         self._job_index.pop(job.id, None)
         self._edf.remove(job.id)
+
+    def _dependencies_completed(self, job: Job) -> bool:
+        """Return whether every declared prerequisite succeeded."""
+        return all(
+            dependency_id in self._known_jobs
+            and self._known_jobs[dependency_id].status is JobStatus.COMPLETED
+            for dependency_id in job.depends_on
+        )
 
     def _update_fairness_after_batch(
         self,

@@ -187,6 +187,41 @@ class TestWorkloadGenerator:
         jobs = gen.generate(profile)
         assert all(j.deadline is not None for j in jobs)
 
+    def test_arrival_patterns_are_deterministic_and_non_bulk(self):
+        profile = WorkloadProfile(
+            tenant_id="stream",
+            num_jobs=20,
+            arrival_pattern="poisson",
+            arrival_rate=4,
+        )
+        jobs1 = WorkloadGenerator(seed=7).generate(profile)
+        jobs2 = WorkloadGenerator(seed=7).generate(profile)
+
+        offsets1 = [job.metadata["arrival_offset"] for job in jobs1]
+        offsets2 = [job.metadata["arrival_offset"] for job in jobs2]
+        assert offsets1 == offsets2
+        assert offsets1 == sorted(offsets1)
+        assert offsets1[-1] > offsets1[0]
+
+    def test_invalid_arrival_pattern_is_rejected(self):
+        with pytest.raises(ValueError, match="Unknown arrival pattern"):
+            WorkloadProfile(arrival_pattern="random")
+
+    def test_generate_burst_keeps_legacy_default_burst_fraction(self):
+        jobs = WorkloadGenerator(seed=3).generate_burst(
+            WorkloadProfile(
+                tenant_id="burst",
+                num_jobs=10,
+                inter_arrival_range=(0.1, 0.1),
+            )
+        )
+        offsets = [job.metadata["arrival_offset"] for job in jobs]
+        assert offsets[:5] == [0.0] * 5
+        assert offsets[5:] == pytest.approx([0.1, 0.2, 0.3, 0.4, 0.5])
+        assert [
+            job.submit_time - jobs[0].submit_time for job in jobs
+        ] == pytest.approx(offsets)
+
     def test_multi_tenant(self):
         gen = WorkloadGenerator(seed=1)
         profiles = [

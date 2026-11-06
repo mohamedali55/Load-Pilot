@@ -132,6 +132,53 @@ async def test_retry_policy_allows_configured_retry_count_and_notifies_once():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("job_retry_limit", "expected_attempts"),
+    [(0, 1), (1, 2), (None, 3)],
+)
+async def test_job_retry_limit_overrides_or_inherits_engine_default(
+    job_retry_limit: int | None,
+    expected_attempts: int,
+):
+    pool = WorkerPool(max_workers=1)
+    executor = AsyncExecutor(
+        pool,
+        RetryPolicy(max_retries=2, base_delay=0, max_delay=0),
+    )
+    attempts = 0
+    notifications: list[JobStatus] = []
+
+    async def payload():
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("expected failure")
+
+    async def on_completion(job: Job):
+        notifications.append(job.status)
+
+    executor.on_completion(on_completion)
+    retry_task = executor.start_retry_processor()
+    job = Job(
+        id=f"retry-limit-{job_retry_limit}",
+        tenant_id="tenant",
+        payload=payload,
+        max_retries=job_retry_limit,
+    )
+    try:
+        await executor.execute(job)
+        for _ in range(100):
+            if notifications:
+                break
+            await asyncio.sleep(0.001)
+        assert job.status is JobStatus.FAILED
+        assert attempts == expected_attempts
+        assert notifications == [JobStatus.FAILED]
+    finally:
+        await executor.shutdown(timeout=1)
+        await asyncio.gather(retry_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_engine_runs_jobs_concurrently_and_releases_resources():
     config = EngineConfig(
         max_workers=2,

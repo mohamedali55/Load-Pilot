@@ -6,10 +6,11 @@ Produces deterministic, reproducible workload traces for testing and benchmarkin
 
 from __future__ import annotations
 
+import math
 import random
 import time
 from dataclasses import dataclass, field
-from typing import Iterator
+from typing import Iterator, Literal
 
 from loadpilot.workload.models import Job, Priority, Tenant
 
@@ -41,10 +42,29 @@ class WorkloadProfile:
     inter_arrival_range: tuple[float, float] = (0.01, 0.1)  # seconds between jobs
 
     # retry
-    max_retries: int = 1
+    max_retries: int | None = None
+
+    # Arrival process for simulation traces.
+    arrival_pattern: Literal["bulk", "uniform", "poisson", "burst"] = "bulk"
+    arrival_rate: float = 10.0
+    arrival_duration: float = 10.0
 
     # dependencies: fraction of jobs that depend on a previous job
     dependency_fraction: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.num_jobs < 0:
+            raise ValueError("num_jobs must be non-negative")
+        if self.max_retries is not None and self.max_retries < 0:
+            raise ValueError("max_retries must be >= 0")
+        if self.arrival_pattern not in {"bulk", "uniform", "poisson", "burst"}:
+            raise ValueError(f"Unknown arrival pattern: {self.arrival_pattern!r}")
+        if not math.isfinite(self.arrival_rate) or self.arrival_rate <= 0:
+            raise ValueError("arrival_rate must be finite and positive")
+        if not math.isfinite(self.arrival_duration) or self.arrival_duration < 0:
+            raise ValueError("arrival_duration must be finite and non-negative")
+        if not 0.0 <= self.burst_fraction <= 1.0:
+            raise ValueError("burst_fraction must be between 0 and 1")
 
 
 class WorkloadGenerator:
@@ -61,6 +81,8 @@ class WorkloadGenerator:
         """Generate a batch of jobs from a *profile*."""
         jobs: list[Job] = []
         generated_ids: list[str] = []
+        arrival_offsets = self._arrival_offsets(profile)
+        base_time = time.monotonic()
         priorities = list(profile.priority_distribution.keys())
         weights = list(profile.priority_distribution.values())
 
@@ -73,9 +95,15 @@ class WorkloadGenerator:
             duration = self._rng.uniform(*profile.duration_range)
 
             deadline = None
+            deadline_slack = None
             if self._rng.random() < profile.deadline_fraction:
-                slack = self._rng.uniform(*profile.deadline_slack_range)
-                deadline = time.monotonic() + duration + slack
+                deadline_slack = self._rng.uniform(*profile.deadline_slack_range)
+                deadline = (
+                    base_time
+                    + arrival_offsets[i]
+                    + duration
+                    + deadline_slack
+                )
 
             depends_on: list[str] = []
             if (
@@ -95,11 +123,42 @@ class WorkloadGenerator:
                 deadline=deadline,
                 max_retries=profile.max_retries,
                 depends_on=depends_on,
+                metadata={
+                    "arrival_offset": arrival_offsets[i],
+                    "deadline_slack": deadline_slack,
+                },
             )
+            job.submit_time = base_time + arrival_offsets[i]
             jobs.append(job)
             generated_ids.append(job_id)
 
         return jobs
+
+    def _arrival_offsets(self, profile: WorkloadProfile) -> list[float]:
+        """Generate deterministic arrival offsets for the selected process."""
+        count = profile.num_jobs
+        if profile.arrival_pattern == "bulk":
+            return [0.0] * count
+        if profile.arrival_pattern == "uniform":
+            return sorted(
+                self._rng.uniform(0.0, profile.arrival_duration)
+                for _ in range(count)
+            )
+        if profile.arrival_pattern == "poisson":
+            offsets: list[float] = []
+            arrival = 0.0
+            for _ in range(count):
+                arrival += self._rng.expovariate(profile.arrival_rate)
+                offsets.append(arrival)
+            return offsets
+
+        burst_count = min(count, int(count * profile.burst_fraction))
+        offsets = [0.0] * burst_count
+        arrival = 0.0
+        for _ in range(count - burst_count):
+            arrival += self._rng.uniform(*profile.inter_arrival_range)
+            offsets.append(arrival)
+        return offsets
 
     def generate_burst(
         self,
@@ -110,19 +169,29 @@ class WorkloadGenerator:
         Generate jobs where *burst_size* arrive simultaneously and the rest
         are spaced out.
         """
-        jobs = self.generate(profile)
-        if burst_size is None:
-            burst_size = int(len(jobs) * max(profile.burst_fraction, 0.5))
-
-        now = time.monotonic()
-        for i, job in enumerate(jobs):
-            if i < burst_size:
-                job.submit_time = now
-            else:
-                gap = self._rng.uniform(*profile.inter_arrival_range)
-                now += gap
-                job.submit_time = now
-        return jobs
+        burst_fraction = (
+            max(profile.burst_fraction, 0.5)
+            if burst_size is None
+            else min(1.0, max(0.0, burst_size / max(profile.num_jobs, 1)))
+        )
+        burst_profile = WorkloadProfile(
+            tenant_id=profile.tenant_id,
+            num_jobs=profile.num_jobs,
+            priority_distribution=profile.priority_distribution,
+            cpu_range=profile.cpu_range,
+            memory_range=profile.memory_range,
+            duration_range=profile.duration_range,
+            deadline_fraction=profile.deadline_fraction,
+            deadline_slack_range=profile.deadline_slack_range,
+            burst_fraction=burst_fraction,
+            inter_arrival_range=profile.inter_arrival_range,
+            max_retries=profile.max_retries,
+            arrival_pattern="burst",
+            arrival_rate=profile.arrival_rate,
+            arrival_duration=profile.arrival_duration,
+            dependency_fraction=profile.dependency_fraction,
+        )
+        return self.generate(burst_profile)
 
     def generate_multi_tenant(
         self,

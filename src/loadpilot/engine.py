@@ -103,6 +103,7 @@ class Engine:
         # ---- job tracking ----
         self._all_jobs: dict[str, Job] = {}
         self._deferred: list[Job] = []
+        self._scheduled_jobs: set[str] = set()
 
         # ---- internal state ----
         self._running = False
@@ -136,7 +137,11 @@ class Engine:
 
         Returns the admission decision: ACCEPT, DEFER, or REJECT.
         """
+        if job.id in self._all_jobs:
+            raise ValueError(f"Job {job.id!r} has already been submitted")
+
         job.submit_time = time.monotonic()
+        self._scheduler.track_job(job)
         self._all_jobs[job.id] = job
         self._metrics.record_submission(job)
 
@@ -218,8 +223,13 @@ class Engine:
         except asyncio.CancelledError:
             pass
 
-    async def run_until_drained(self, poll_interval: float = 0.05) -> None:
-        """Start the engine and run until all submitted jobs have completed."""
+    async def run_until_drained(
+        self,
+        poll_interval: float = 0.05,
+        *,
+        pending_submissions: asyncio.Future[None] | None = None,
+    ) -> None:
+        """Run until queued work, retries, and optional incoming submissions drain."""
         if self._running:
             return
 
@@ -234,14 +244,33 @@ class Engine:
                 pending = self._scheduler.pending_count()
                 active = self._pool.active_count
                 deferred = len(self._deferred)
+                scheduled = len(self._scheduled_jobs)
+                inputs_done = pending_submissions is None or pending_submissions.done()
+
+                if inputs_done and pending_submissions is not None:
+                    pending_submissions.result()
 
                 if (
                     pending == 0
                     and active == 0
                     and deferred == 0
+                    and scheduled == 0
                     and self._executor.pending_retry_count == 0
+                    and inputs_done
                 ):
                     break
+
+                if (
+                    pending > 0
+                    and self._scheduler.runnable_count() == 0
+                    and active == 0
+                    and deferred == 0
+                    and scheduled == 0
+                    and self._executor.pending_retry_count == 0
+                    and inputs_done
+                ):
+                    for job in self._scheduler.fail_unresolved_dependencies():
+                        self._finalize_dependency_failure(job)
 
                 await asyncio.sleep(poll_interval)
         finally:
@@ -342,6 +371,9 @@ class Engine:
             await asyncio.sleep(0.01)
 
     async def _schedule_round(self) -> None:
+        for job in self._scheduler.resolve_failed_dependencies():
+            self._finalize_dependency_failure(job)
+
         available_slots = self._pool.available_count
         if available_slots <= 0:
             return
@@ -359,6 +391,7 @@ class Engine:
         self._metrics.record_scheduling_round(sched_duration, len(decisions))
 
         execution_tasks: list[asyncio.Task[None]] = []
+        scheduled_job_ids: list[str] = []
         for decision in decisions:
             if decision.action != "execute":
                 continue
@@ -387,13 +420,25 @@ class Engine:
                     name=f"exec-{job.id}",
                 )
             )
+            self._scheduled_jobs.add(job.id)
+            scheduled_job_ids.append(job.id)
 
         if execution_tasks:
-            await asyncio.gather(*execution_tasks)
+            try:
+                await asyncio.gather(*execution_tasks)
+            finally:
+                self._scheduled_jobs.difference_update(scheduled_job_ids)
 
         # Re-attempt deferred jobs
         if self._deferred and self._pool.available_count > 0:
             self._retry_deferred()
+
+    def _finalize_dependency_failure(self, job: Job) -> None:
+        """Record a job that cannot run because its dependencies did not succeed."""
+        tenant = self._tenants.get(job.tenant_id)
+        if tenant is not None:
+            tenant.current_queued = max(0, tenant.current_queued - 1)
+        self._metrics.record_failure(job)
 
     def _retry_deferred(self) -> None:
         still_deferred: list[Job] = []

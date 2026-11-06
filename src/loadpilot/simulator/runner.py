@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -73,9 +74,17 @@ class SimulationResult:
 class SimulationRunner:
     """Runs a scenario against the LoadPilot engine with a specific policy."""
 
-    def __init__(self, scenario: Scenario, policy: str = "loadpilot") -> None:
+    def __init__(
+        self,
+        scenario: Scenario,
+        policy: str = "loadpilot",
+        arrival_time_scale: float = 1.0,
+    ) -> None:
+        if not math.isfinite(arrival_time_scale) or arrival_time_scale <= 0:
+            raise ValueError("arrival_time_scale must be finite and positive")
         self._scenario = scenario
         self._policy = policy
+        self._arrival_time_scale = arrival_time_scale
         self._capacity_restored_at: float | None = None
 
     async def run(self) -> SimulationResult:
@@ -100,12 +109,12 @@ class SimulationRunner:
             jobs = gen.generate(profile)
             all_jobs.extend(jobs)
 
-        # Submit all jobs
-        for job in all_jobs:
-            engine.submit(job)
-
-        # Schedule scenario events relative to the beginning of the run.
+        # Schedule arrivals and scenario events relative to the beginning of the run.
         start = time.monotonic()
+        submissions_task = asyncio.create_task(
+            self._submit_arrivals(engine, all_jobs, start),
+            name="simulation-arrivals",
+        )
         event_tasks: list[asyncio.Task] = []
         for event in scenario.events:
             task = asyncio.create_task(
@@ -124,13 +133,19 @@ class SimulationRunner:
 
         # Run engine until drained
         try:
-            await engine.run_until_drained(poll_interval=0.02)
+            await engine.run_until_drained(
+                poll_interval=0.02,
+                pending_submissions=submissions_task,
+            )
         finally:
             duration = time.monotonic() - start
             sampler_stop.set()
             await sampler_task
+            if not submissions_task.done():
+                submissions_task.cancel()
             for task in event_tasks:
                 task.cancel()
+            await asyncio.gather(submissions_task, return_exceptions=True)
             if event_tasks:
                 event_results = await asyncio.gather(
                     *event_tasks,
@@ -149,6 +164,35 @@ class SimulationRunner:
             duration,
             utilization_samples,
         )
+
+    async def _submit_arrivals(
+        self,
+        engine: Engine,
+        jobs: list[Job],
+        start_time: float,
+    ) -> None:
+        """Submit jobs at their generated arrival offsets."""
+        for job in sorted(
+            jobs,
+            key=lambda item: (
+                item.metadata.get("arrival_offset", 0.0),
+                item.submit_time,
+                item.id,
+            ),
+        ):
+            offset = (
+                float(job.metadata.get("arrival_offset", 0.0))
+                * self._arrival_time_scale
+            )
+            deadline_slack = job.metadata.get("deadline_slack")
+            if deadline_slack is not None:
+                job.deadline = (
+                    start_time + offset + job.estimated_duration + deadline_slack
+                )
+            delay = start_time + offset - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            engine.submit(job)
 
     async def _apply_event(
         self,

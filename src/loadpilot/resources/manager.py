@@ -55,6 +55,11 @@ class ResourceManager:
         )
 
     @property
+    def total_capacity(self) -> ResourceVector:
+        """Return configured system capacity before active reservations."""
+        return self._total
+
+    @property
     def utilization(self) -> float:
         """Max utilisation ratio across all resource dimensions."""
         return self._reserved.utilization_ratio(self._total)

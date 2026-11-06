@@ -128,6 +128,7 @@ class AdmissionController:
         return AdmissionContext(
             system_pressure=self._system_pressure,
             resource_available=self._resource_manager.available,
+            resource_capacity=self._resource_manager.total_capacity,
             tenant_queue_size=tenant.current_queued,
             tenant_running_count=tenant.current_running,
             tenant_max_queue=tenant.max_queue_size,

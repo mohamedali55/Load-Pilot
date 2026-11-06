@@ -137,14 +137,46 @@ asyncio.run(main())
 
 Available scenarios include burst traffic, tenant monopolisation, capacity reduction, deadline pressure, expensive jobs, and mixed workloads. Reports compare throughput, latency percentiles, fairness, deadline misses, and scheduling overhead.
 
+For a focused, paired comparison of LoadPilot and DRR, run the predeclared experiment matrix:
+
+```bash
+python -m loadpilot.benchmarks.experiments
+```
+
+It uses the same generated jobs and arrival trace for both policies across five fixed seeds and three workloads: balanced Poisson arrivals, priority/deadline pressure, and skewed resource costs. The report includes predeclared outcomes and performance metrics for every scenario, plus paired win/loss/tie counts; it does not select only favorable workloads.
+
+### LoadPilot vs DRR results
+
+Results from the five fixed seeds (`11, 23, 37, 51, 79`) with arrival-time scale `0.25`. Latency is milliseconds; utilization is a ratio; throughput is completed jobs per simulated second. Deferral is reported as events (a job may be deferred more than once). The first table shows medians across repetitions for all predeclared run-level outcome and performance metrics.
+
+| Scenario | Policy | Runs | Duration s | Submitted | Completed | Failed | Rejected | Deferral events | Timed out | Cancelled | Wait p50/p95/p99 ms | Exec p50/p95/p99 ms | Fairness | Deadline misses count/rate | Peak/avg utilization | Scheduling overhead ms | Recovery s | Throughput/s |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Balanced Poisson | DRR | 5 | 0.5894 | 108 | 108 | 0 | 0 | 50 | 0 | 0 | 188.339/388.559/388.849 | 14.823/15.780/16.016 | 1.0000 | 0/0.00% | 1.0000/0.4500 | 0.2746 | 0.0000 | 183.23 |
+| Balanced Poisson | LoadPilot | 5 | 0.5889 | 108 | 108 | 0 | 0 | 53 | 0 | 0 | 200.708/375.935/403.711 | 14.986/15.965/16.049 | 1.0000 | 0/0.00% | 1.0000/0.4500 | 0.2484 | 0.0000 | 183.39 |
+| Priority/deadlines | DRR | 5 | 1.3386 | 180 | 180 | 0 | 0 | 79 | 0 | 0 | 483.546/985.398/1031.070 | 14.784/15.776/16.012 | 0.9000 | 40/66.67% | 1.0000/0.4480 | 0.3679 | 0.0000 | 134.47 |
+| Priority/deadlines | LoadPilot | 5 | 1.3461 | 180 | 180 | 0 | 0 | 83 | 0 | 0 | 486.054/1017.954/1050.067 | 14.914/15.776/16.255 | 0.9000 | 42/70.00% | 1.0000/0.4480 | 0.3272 | 0.0000 | 133.72 |
+| Resource-cost skew | DRR | 5 | 1.4315 | 150 | 150 | 0 | 0 | 76 | 0 | 0 | 966.801/1167.322/1198.061 | 14.810/15.705/15.953 | 0.9615 | 0/0.00% | 1.0000/0.4787 | 0.4487 | 0.0000 | 104.78 |
+| Resource-cost skew | LoadPilot | 5 | 1.4339 | 150 | 150 | 0 | 0 | 69 | 0 | 0 | 363.944/1121.059/1184.007 | 14.907/15.859/16.118 | 0.9615 | 0/0.00% | 1.0000/0.4787 | 0.2461 | 0.0000 | 104.61 |
+
+The next table gives LoadPilot wins/losses/ties against DRR for each paired seed. Higher completion, fairness, and throughput are better; lower wait, execution, deadline-miss rate, and scheduling overhead are better.
+
+| Scenario | Completed | Wait p95 | Exec p95 | Fairness | Deadline misses | Throughput | Scheduling overhead |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Balanced Poisson | 0/0/5 | 2/3/0 | 2/3/0 | 0/0/5 | 0/0/5 | 4/1/0 | 5/0/0 |
+| Priority/deadlines | 0/0/5 | 2/3/0 | 2/3/0 | 0/0/5 | 2/3/0 | 2/3/0 | 5/0/0 |
+| Resource-cost skew | 0/0/5 | 4/1/0 | 1/4/0 | 0/0/5 | 0/0/5 | 0/5/0 | 5/0/0 |
+
+Both policies completed all jobs and had identical fairness in every paired run. LoadPilot had lower scheduling overhead in all 15 comparisons and lower p95 wait in four of five resource-cost-skew runs, but it did not consistently win on wait, execution time, or throughput. For deadline misses, LoadPilot won two paired runs and lost three; its median miss rate was higher (70% vs. 66.67%). These small synthetic experiments show tradeoffs, not a universal winner; conclusions are limited to the disclosed workload matrix, seeds, simulator timing, and current policy parameters.
+
 ## Simulation scope
 
 The simulator is intended for comparing scheduling behavior; it is not a model of real hardware or a live traffic replay:
 
 - Synthetic jobs sleep for their estimated duration. CPU and memory are tracked from estimates and are not physically consumed.
-- Scenario jobs are submitted in bulk; generated inter-arrival times are not replayed as a live stream.
-- `Job.depends_on` is represented in the model, but dependency completion is not enforced by the scheduler.
-- Retries use the engine-wide settings in `EngineConfig`; the per-job `max_retries` field does not currently set the retry limit.
+- Workload profiles can use bulk, uniform, Poisson, or burst arrivals. Simulations submit jobs at the generated offsets; `arrival_time_scale` can compress or expand those offsets.
+- A job with `depends_on` is held until every prerequisite completes successfully. Missing prerequisites and dependency cycles fail once the input stream has ended and no runnable work remains; a failed prerequisite fails its dependents.
+- `Job.max_retries` overrides the engine-wide retry limit when set. `None` inherits `EngineConfig.default_max_retries`; `0` disables retries for that job.
+- A job that fits total resource capacity but not currently available resources is deferred rather than rejected. Jobs whose estimates exceed total capacity are rejected.
 
 ## Tests
 

@@ -52,7 +52,14 @@ class RetryPolicy:
 
     def should_retry(self, job: Job) -> bool:
         """Return ``True`` if the job still has retry budget remaining."""
-        return job.attempt <= self.max_retries
+        retry_limit = (
+            self.max_retries if job.max_retries is None else job.max_retries
+        )
+        return job.attempt <= retry_limit
+
+    def retry_limit_for(self, job: Job) -> int:
+        """Return the job-specific retry limit or the policy default."""
+        return self.max_retries if job.max_retries is None else job.max_retries
 
     def delay(self, attempt: int) -> float:
         """Compute delay for the given *attempt* (0-indexed).
@@ -150,10 +157,11 @@ class AsyncExecutor:
 
         if job.status in (JobStatus.FAILED, JobStatus.TIMED_OUT):
             if self._retry.should_retry(job):
+                retry_limit = self._retry.retry_limit_for(job)
                 delay = self._retry.delay(job.attempt - 1)
                 job.trace(
                     f"Retry scheduled (attempt {job.attempt + 1}/"
-                    f"{self._retry.max_retries + 1}) after {delay:.2f}s"
+                    f"{retry_limit + 1}) after {delay:.2f}s"
                 )
                 logger.info(
                     "Job %s queued for retry (attempt %d) after %.2fs",

@@ -33,6 +33,8 @@ class AdmissionContext:
         Overall system pressure metric between 0.0 (idle) and 1.0 (overloaded).
     resource_available:
         Currently available global resources.
+    resource_capacity:
+        Total global capacity before active reservations, when available.
     tenant_queue_size:
         Number of jobs this tenant already has queued (admitted but not running).
     tenant_running_count:
@@ -55,6 +57,7 @@ class AdmissionContext:
     tenant_max_concurrent: int | None
     total_queue_size: int
     max_queue_size: int
+    resource_capacity: ResourceVector | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +95,11 @@ class ResourceBasedPolicy:
         cost = job.resource_estimate
         if cost.fits_within(context.resource_available):
             return AdmissionDecision.ACCEPT
+        if (
+            context.resource_capacity is not None
+            and cost.fits_within(context.resource_capacity)
+        ):
+            return AdmissionDecision.DEFER
         return AdmissionDecision.REJECT
 
 
